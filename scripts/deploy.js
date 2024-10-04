@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 require("dotenv").config();
 const { ethers } = require("hardhat");
 const axios = require("axios");
@@ -6,134 +7,138 @@ const FormData = require("form-data");
 
 async function main() {
     const [deployer] = await ethers.getSigners();
-
     console.log("Deploying contracts with the account:", deployer.address);
 
     // Determine if we're deploying to testnet or mainnet
     const network = hre.network.name;
     const isMainnet = network === "etherlink_mainnet";
+    const balance = await deployer.getBalance();
+    console.log(`Wallet balance: ${ethers.utils.formatUnits(balance, 18)} XTZ`);
 
-    // Fetch contract addresses from environment variables
-    const lettuceAddress = isMainnet ? process.env.LETTUCE_MAINNET : process.env.LETTUCE_TESTNET;
-    const tomatoAddress = isMainnet ? process.env.TOMATO_MAINNET : process.env.TOMATO_TESTNET;
-    const mayoAddress = isMainnet ? process.env.MAYO_MAINNET : process.env.MAYO_TESTNET;
-    const baconAddress = isMainnet ? process.env.BACON_MAINNET : process.env.BACON_TESTNET;
-    const breadAddress = isMainnet ? process.env.BREAD_MAINNET : process.env.BREAD_TESTNET;
+    // Fetch addresses from environment variables
+    const lettuceAddress = validateAddress(
+        isMainnet ? process.env.LETTUCE_MAINNET : process.env.LETTUCE_TESTNET,
+        "Lettuce NFT"
+    );
+    const tomatoAddress = validateAddress(
+        isMainnet ? process.env.TOMATO_MAINNET : process.env.TOMATO_TESTNET,
+        "Tomato NFT"
+    );
+    const mayoAddress = validateAddress(isMainnet ? process.env.MAYO_MAINNET : process.env.MAYO_TESTNET, "Mayo Token");
+    const baconAddress = validateAddress(
+        isMainnet ? process.env.BACON_MAINNET : process.env.BACON_TESTNET,
+        "Bacon Token"
+    );
+    const breadAddress = validateAddress(
+        isMainnet ? process.env.BREAD_MAINNET : process.env.BREAD_TESTNET,
+        "Bread Token"
+    );
 
-    // Fetch the payment recipient
-    const paymentRecipient = process.env.PAYMENT_RECIPIENT;
+    // Fetch the payment recipient and admin address
+    const paymentRecipient = validateAddress(process.env.PAYMENT_RECIPIENT, "Payment Recipient");
+    const adminAddress = validateAddress(deployer.address, "Admin Address");
 
-    // Validate addresses
-    const addresses = {
-        lettuceAddress,
-        tomatoAddress,
-        mayoAddress,
-        baconAddress,
-        breadAddress,
-        paymentRecipient,
-    };
+    // Fetch and validate minting and royalty parameters
+    const maxMintable = validatePositiveNumber(process.env.MAX_MINTABLE, "Max Mintable");
+    const lettuceRequired = validatePositiveNumber(process.env.LETTUCE_REQUIRED, "Lettuce Required");
+    const tomatoRequired = validatePositiveNumber(process.env.TOMATO_REQUIRED, "Tomato Required");
 
-    for (const [name, address] of Object.entries(addresses)) {
-        if (!ethers.utils.isAddress(address)) {
-            throw new Error(`Invalid address for ${name}: ${address}`);
-        }
-    }
+    const royaltyRecipient = validateAddress(process.env.ROYALTY_RECIPIENT, "Royalty Recipient");
+    const royaltyBps = validatePositiveNumber(process.env.ROYALTY_BPS, "Royalty BPS");
 
-    // Fetch initial prices directly from environment variables
-    const mayoCost = ethers.utils.parseUnits(process.env.MAYO_COST, 18); // Assuming token has 18 decimals
-    const baconCost = ethers.utils.parseUnits(process.env.BACON_COST, 18); // Assuming token has 18 decimals
-    const breadCost = ethers.utils.parseUnits(process.env.BREAD_COST, 18); // Assuming token has 18 decimals
+    // Validate and fetch costs
+    const mayoCost = parseTokenCost(process.env.MAYO_COST, "Mayo Token");
+    const baconCost = parseTokenCost(process.env.BACON_COST, "Bacon Token");
+    const breadCost = parseTokenCost(process.env.BREAD_COST, "Bread Token");
 
-    // Fetch initial NFT burn requirements from environment variables
-    const lettuceRequired = process.env.LETTUCE_REQUIRED;
-    const tomatoRequired = process.env.TOMATO_REQUIRED;
-
-    // Fetch the initial royalty recipient and royalty BPS from environment variables
-    const royaltyRecipient = process.env.ROYALTY_RECIPIENT;
-    const royaltyBps = process.env.ROYALTY_BPS;
-
-    // Ensure all required variables are defined
-    if (!royaltyRecipient || !royaltyBps) {
-        throw new Error("Missing royaltyRecipient or royaltyBps environment variables");
-    }
-
-    // Metadata and image for the NFT
-    const nftName = "BLTNFT";
-    const nftSymbol = "BLT"; // Symbol for the NFT
-    const nftDescription =
-        "A delicious BLT made from Lettuce, Tomato, Mayo, Bacon, and Bread. The shining star of any sandwich shop! Look at you, you go getter you! You're a sandwich artist!";
+    // Pin image to IPFS for the thumbnail
     const imageFilePath = "./images/blt.jpg"; // Path to your NFT image
-
-    // Pinata API Keys
     const pinataApiKey = process.env.PINATA_API_KEY;
     const pinataSecretApiKey = process.env.PINATA_SECRET_API_KEY;
+    const imageCID = await safelyPinFileToIPFS(imageFilePath, pinataApiKey, pinataSecretApiKey);
 
-    // Upload image to IPFS via Pinata
-    const imageCID = await pinFileToIPFS(imageFilePath, pinataApiKey, pinataSecretApiKey);
+    // Check if image upload failed
+    if (!imageCID) {
+        throw new Error("Image upload to IPFS failed. Aborting deployment.");
+    }
+
     console.log(`Image uploaded to IPFS with CID: ${imageCID}`);
 
-    // Create and upload metadata to IPFS via Pinata
-    const metadata = {
-        name: nftName,
-        description: nftDescription,
-        image: `ipfs://${imageCID}`,
-    };
-    const metadataCID = await pinJSONToIPFS(metadata, pinataApiKey, pinataSecretApiKey);
-    console.log(`Metadata uploaded to IPFS with CID: ${metadataCID}`);
+    // Use this IPFS URL for the image in the contract
+    const imageURI = `ipfs://${imageCID}`;
 
     // Fetch the contract factory
     const BLTNFT = await ethers.getContractFactory("CustomERC1155LazyMint");
 
-    // Deploy the contract
+    // Deploy the contract with the pinned image URI (thumbnailURI)
     const bltnft = await BLTNFT.deploy(
-        deployer.address, // Admin address
-        nftName, // Name
-        nftSymbol, // Symbol
-        royaltyRecipient, // Royalty recipient
-        royaltyBps, // Royalty BPS
-        mayoAddress, // MAYO Token address
-        mayoCost, // MAYO Token cost
-        baconAddress, // BACON Token address
-        baconCost, // BACON Token cost
-        breadAddress, // BREAD Token address
-        breadCost, // BREAD Token cost
-        lettuceAddress, // Lettuce NFT address
-        tomatoAddress, // Tomato NFT address
-        paymentRecipient, // Payment recipient
-        lettuceRequired, // Initial Lettuce NFTs required
-        tomatoRequired // Initial Tomato NFTs required
+        adminAddress,
+        "BLTNFT", // Name
+        "BLT", // Symbol
+        royaltyRecipient,
+        royaltyBps,
+        mayoAddress,
+        mayoCost,
+        baconAddress,
+        baconCost,
+        breadAddress,
+        breadCost,
+        lettuceAddress,
+        tomatoAddress,
+        paymentRecipient,
+        lettuceRequired,
+        tomatoRequired,
+        maxMintable,
+        imageURI // Pass the image URI (thumbnailURI) to the contract
     );
 
     await bltnft.deployed();
-
     console.log(`BLTNFT deployed to: ${bltnft.address} on ${network}`);
 }
 
-async function pinFileToIPFS(filePath, apiKey, secretApiKey) {
-    const data = new FormData();
-    data.append("file", fs.createReadStream(filePath));
-
-    const res = await axios.post("https://api.pinata.cloud/pinning/pinFileToIPFS", data, {
-        headers: {
-            "Content-Type": `multipart/form-data; boundary=${data._boundary}`,
-            pinata_api_key: apiKey,
-            pinata_secret_api_key: secretApiKey,
-        },
-    });
-
-    return res.data.IpfsHash;
+// Utility function to validate addresses
+function validateAddress(address, label) {
+    if (!ethers.utils.isAddress(address)) {
+        throw new Error(`Invalid address for ${label}: ${address}`);
+    }
+    return address;
 }
 
-async function pinJSONToIPFS(json, apiKey, secretApiKey) {
-    const res = await axios.post("https://api.pinata.cloud/pinning/pinJSONToIPFS", json, {
-        headers: {
-            "Content-Type": "application/json",
-            pinata_api_key: apiKey,
-            pinata_secret_api_key: secretApiKey,
-        },
-    });
+// Utility function to validate positive numbers
+function validatePositiveNumber(value, label) {
+    const num = Number(value);
+    if (isNaN(num) || num <= 0) {
+        throw new Error(`${label} must be a positive number. Received: ${value}`);
+    }
+    return num;
+}
 
-    return res.data.IpfsHash;
+// Utility function to parse token costs (assumes 18 decimals)
+function parseTokenCost(value, label) {
+    try {
+        return ethers.utils.parseUnits(value, 18); // Defaulting to 18 decimals
+    } catch (error) {
+        throw new Error(`Error parsing token cost for ${label}: ${value}`);
+    }
+}
+
+// Utility function to pin a file to IPFS with error handling
+async function safelyPinFileToIPFS(filePath, apiKey, secretApiKey) {
+    try {
+        const data = new FormData();
+        data.append("file", fs.createReadStream(filePath));
+        const res = await axios.post("https://api.pinata.cloud/pinning/pinFileToIPFS", data, {
+            headers: {
+                "Content-Type": `multipart/form-data; boundary=${data._boundary}`,
+                pinata_api_key: apiKey,
+                pinata_secret_api_key: secretApiKey,
+            },
+        });
+        return res.data.IpfsHash;
+    } catch (error) {
+        console.error("Error uploading file to IPFS:", error);
+        return null;
+    }
 }
 
 main()
